@@ -1,0 +1,13 @@
+name: Keep Render bot awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping bot health endpoint
+        run: curl -fsS https://manifst-bot.onrender.com/ || true
