@@ -1,6 +1,6 @@
 # Деплой Telegram-бота
 
-Точка входа: `main.py`. Токен берётся из переменной окружения `API_BOT_TOKEN`
+Точка входа: `main.py` (для Render — `serve.py`, который дополнительно держит открытым порт `$PORT` для health-check веб-сервиса). Токен берётся из переменной окружения `API_BOT_TOKEN`
 (или `BOT_TOKEN` / `TELEGRAM_BOT_TOKEN`).
 
 ## Render.com (бесплатный worker)
