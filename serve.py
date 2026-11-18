@@ -3,6 +3,8 @@
 import asyncio
 import os
 import threading
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import main
@@ -25,6 +27,17 @@ def start_health_server() -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
+def keep_awake() -> None:
+    url = os.environ.get("RENDER_EXTERNAL_URL", "https://manifst-bot.onrender.com").rstrip("/") + "/"
+    while True:
+        time.sleep(300)
+        try:
+            urllib.request.urlopen(url, timeout=10).read()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     start_health_server()
+    threading.Thread(target=keep_awake, daemon=True).start()
     asyncio.run(main.main())
