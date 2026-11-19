@@ -1,9 +1,29 @@
 import asyncio
 from html import escape
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import os
 import secrets
 import sqlite3
+
+
+def load_dotenv_file() -> None:
+    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.isfile(dotenv_path):
+        return
+
+    with open(dotenv_path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            os.environ.setdefault(key, value)
+
+
+load_dotenv_file()
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
@@ -37,7 +57,7 @@ TELEGRAM_PAYMENT_PROVIDER_TOKEN = os.environ.get("TELEGRAM_PAYMENT_PROVIDER_TOKE
 DATABASE_PATH = os.environ.get(
     "BOT_DATABASE_PATH", os.path.join(os.path.dirname(__file__), "bot_data.sqlite3")
 )
-FREE_PUBLICATION_PERIOD = timedelta(days=7)
+FREE_PUBLICATIONS_PER_MONTH = 4
 EXTRA_PUBLICATION_PRICE = 200
 
 bot = Bot(token=API_BOT_TOKEN)
@@ -82,14 +102,15 @@ def initialize_database() -> None:
 
 
 def has_free_publication(user_id: int) -> bool:
-    cutoff = (datetime.now(timezone.utc) - FREE_PUBLICATION_PERIOD).isoformat()
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
     with sqlite3.connect(DATABASE_PATH) as connection:
         row = connection.execute(
-            "SELECT 1 FROM listing_publications "
-            "WHERE user_id = ? AND published_at >= ? LIMIT 1",
-            (user_id, cutoff),
+            "SELECT COUNT(*) FROM listing_publications "
+            "WHERE user_id = ? AND published_at >= ?",
+            (user_id, month_start),
         ).fetchone()
-    return row is None
+    return row is not None and row[0] < FREE_PUBLICATIONS_PER_MONTH
 
 
 def has_paid_publication_credit(user_id: int) -> bool:
@@ -173,7 +194,7 @@ async def on_startup() -> None:
 async def request_extra_publication_payment(message: Message, user_id: int) -> None:
     if not TELEGRAM_PAYMENT_PROVIDER_TOKEN:
         await message.answer(
-            "Вы уже опубликовали бесплатное объявление за последние 7 дней. "
+            "Вы использовали 4 бесплатные публикации в этом месяце. "
             "Дополнительная публикация стоит 200 KZT, вы можете  оплатить пишите админу @Bei4ka."
         )
         return
@@ -264,6 +285,11 @@ async def help_command(message: Message) -> None:
         "Это бот-манифест. Он помогает добавлять объявления, следить за балансом и управлять каналами.\n"
         "Команды: /start, /help"
     )
+
+
+@dp.message(F.text == "Мой профиль")
+async def my_profile(message: Message) -> None:
+    await message.answer("чо ты свой профиль чекаеш?")
 
 
 @dp.message(F.text == "Продвижение")
@@ -585,13 +611,8 @@ async def publish_listing_preview(message: Message, user_id: int) -> None:
     next_listing_id += 1
 
     photo_ids = listing_photos.get(user_id, [])[:10]
-    if photo_ids:
-        await message.answer_media_group(
-            media=[InputMediaPhoto(media=photo_id) for photo_id in photo_ids]
-        )
-
     title = escape(listing_titles.get(user_id, "Товар"))
-    description = escape(listing_descriptions.get(user_id, ""))
+    raw_description = listing_descriptions.get(user_id, "")
     price = listing_prices.get(user_id, 0)
     listing_type = listing_types.get(user_id, "sell")
     listing_label = LISTING_TYPE_LABELS.get(listing_type, LISTING_TYPE_LABELS["sell"])
@@ -599,44 +620,79 @@ async def publish_listing_preview(message: Message, user_id: int) -> None:
         contact_text = f"📞 {escape(listing_phone_numbers.get(user_id, 'Номер передан Telegram'))}"
     else:
         contact_text = "📱 Номер скрыт, свяжитесь через Telegram"
-    text = (
-        f"{listing_label} | №{listing_id}\n\n"
-        f"📍 Казахстан\n\n"
-        f"<b>{title}</b>\n\n"
-        f"{description}\n\n"
-        f"💰 {price} KZT\n"
-        f"🚚 Доставка: уточняется\n\n"
-        f"{contact_text}\n\n"
-        "✅ Объявление готово к публикации"
+    channel_link = f"https://t.me/{TELEGRAM_CHANNEL_ID.lstrip('@')}"
+
+    def build_text(description: str, footer: str) -> str:
+        return (
+            f"{listing_label} | №{listing_id}\n\n"
+            "📍 Казахстан\n\n"
+            f"<b>{title}</b>\n\n"
+            f"{escape(description)}\n\n"
+            f"💰 {price} KZT\n"
+            "🚚 Доставка: уточняется\n\n"
+            f"{contact_text}\n\n"
+            f"{footer}"
+        )
+
+    def fit_caption(footer: str) -> str:
+        # Telegram limits a photo caption to 1024 characters.
+        description = raw_description
+        caption = build_text(description, footer)
+        while len(caption) > 1024 and description:
+            excess = len(caption) - 1024
+            description = description[: max(0, len(description) - excess - 1)] + "…"
+            caption = build_text(description, footer)
+        return caption
+
+    contact_link = f'<a href="tg://user?id={user_id}">Связаться</a>'
+    channel_caption = fit_caption(contact_link)
+    preview_caption = fit_caption(
+        "✅ Объявление готово к публикации\n"
+        f'<a href="{channel_link}">Открыть канал</a>'
     )
+
+    def media_with_caption(caption: str) -> list[InputMediaPhoto]:
+        media = []
+        for index, photo_id in enumerate(photo_ids):
+            if index == 0:
+                media.append(
+                    InputMediaPhoto(media=photo_id, caption=caption, parse_mode="HTML")
+                )
+            else:
+                media.append(InputMediaPhoto(media=photo_id))
+        return media
+
     publication_error = None
     try:
         if photo_ids:
             await bot.send_media_group(
                 chat_id=TELEGRAM_CHANNEL_ID,
-                media=[InputMediaPhoto(media=photo_id) for photo_id in photo_ids],
+                media=media_with_caption(channel_caption),
             )
-        await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Связаться", url=f"tg://user?id={user_id}")]
-                ]
-            ),
-        )
+        else:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                text=channel_caption,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="Связаться", url=f"tg://user?id={user_id}")]
+                    ]
+                ),
+            )
     except TelegramAPIError as error:
         publication_error = str(error)
 
     if publication_error is None:
         record_successful_publication(user_id, use_paid_credit)
 
-    channel_link = f"https://t.me/{TELEGRAM_CHANNEL_ID.lstrip('@')}"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="Открыть канал", url=channel_link)]]
     )
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    if photo_ids:
+        await message.answer_media_group(media=media_with_caption(preview_caption))
+    else:
+        await message.answer(preview_caption, reply_markup=keyboard, parse_mode="HTML")
     if publication_error is None:
         await message.answer(f"🎉 Объявление №{listing_id} опубликовано в канале.")
         listing_titles.pop(user_id, None)
